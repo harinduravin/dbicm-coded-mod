@@ -1,9 +1,13 @@
-EbNoVec = (5.5:0.04:5.94)';      % Eb/No values (dB)
+EbNoVec = (5.65:0.05:5.7)';      % Eb/No values (dB)
 berEst = zeros(size(EbNoVec));
 
 % Delay profile
 delay_profile = [0 0 1 0 1];
+inverse_delay_profile = [1 1 0 1 0];
 seed = 124;
+% Window size
+W = 5+1;
+num_sub_iter = 5;
 
 %%%%%%%%%%%%%%%%%%%%%%%%%%%%%
 p = dvbs2ldpc(2/3);
@@ -40,6 +44,7 @@ s_2_p1 = reshape(inter1, length(inter1)/5, 5).';
 s_2_p2 = reshape(inter2, length(inter2)/5, 5).';
 s_2_p3 = reshape(inter3, length(inter3)/5, 5).';
 
+
 for n = 1:length(EbNoVec)
    
     % Reset initialization values
@@ -48,10 +53,14 @@ for n = 1:length(EbNoVec)
     iteration = 0;
     parallel_data_old = zeros(size(s_2_p0));
     s_2_pllr = zeros(size(s_2_p0)) + Inf;
+    demodulated = zeros(length(inter0),W);
+    rx_symbols_stack = zeros(length(inter0)/5,W);
  
     while numErrs < 30000 && numBits < 1e7
 
         iteration = iteration +1;
+
+        %%%%%%%%%% Transmitter %%%%%%%%%%
 
         switch mod(iteration,4)
             case 0
@@ -82,72 +91,155 @@ for n = 1:length(EbNoVec)
 
         %%%%%%%%%% Receiver %%%%%%%%%%
 
+        % Storing received symbols for window size time period
+        rx_symbols_stack(:,1:W-1) = rx_symbols_stack(:,2:W);
+        rx_symbols_stack(:,W) = rx_symbols;
+
         % Demodulation
-        demodulated = APSK_32_demapper_optimized(rx_symbols, EbNoVec(n));
+
+        demodulated(:,1:W-1) = demodulated(:,2:W);
+        demodulated(:,W) = APSK_32_demapper_optimized(rx_symbols, EbNoVec(n));
         % demodulated =dvbsapskdemod(rx_symbols,32,'s2x','2/3','OutputType','llr','NoiseVariance',1/((2/3)*2*10^((EbNoVec(n)+10*log10(5))/10)),'UnitAveragePower',true);
 
         % Converting to serial to parallel
-        s_2_p_rx = reshape(demodulated, 5, length(demodulated)/5);
-
-        if iteration ~= 1
-            % Reverse delay module
-            undecoded = s_2_p_rx_old;
-            undecoded(delay_profile == 1, :) = s_2_p_rx(delay_profile == 1, :);
-    
-            % Ready to decode
-            undecoded_T = undecoded.';
-            undecoded_flat = undecoded_T(:);
-    
-            % Deinterleaving
-            undecoded_deintered = randdeintrlv(undecoded_flat,seed); % Deinterleave.
-    
-            % Decoding
-            decodedllr = ldpcDecoder(undecoded_deintered);
-            % rxBits = ldpcDecoderHard(undecoded_deintered);
-            rxBits = decodedllr(1:43200)<0;
-    
-            %%%%%%%%%%%%%%%%%%%%%%%%%%%%%
-            % Storing soft LLR values for feedback
-            
-            % Interleaving
-            interllr = randintrlv(decodedllr,seed); % Interleave.
-            
-            % Serial to parallel
-            s_2_pllr = reshape(interllr, length(interllr)/5, 5).';
-            s_2_pllr(delay_profile == 0, :) = 0;
-
-
-            % Implementing hard feedback
-
-            % s_2_pllr(s_2_pllr>0) = Inf;
-            % s_2_pllr(s_2_pllr<0) = -Inf;
-            
-            %%%%%%%%%%%%%%%%%%%%%%%%%%%%%
-    
-            MSG=rxBits;
-                
-            % Calculate the number of bit errors
-            switch mod(iteration,4)
-                case 1
-                    nErrors = biterr(msg0,MSG);
-                case 2
-                    nErrors = biterr(msg1,MSG);
-                case 3
-                    nErrors = biterr(msg2,MSG);
-                otherwise
-                    nErrors = biterr(msg3,MSG);
-            end
-
-            % Increment the error and bit counters
-            numErrs = numErrs + nErrors;
-            numBits = numBits + length(msg0);
+        s_2_p_rx_stack = zeros(5,length(rx_symbols),W);
+        for i = 1:W
+            s_2_p_rx_stack(:,:,i) = reshape(demodulated(:,i), 5, length(demodulated(:,i))/5);
         end
 
-        demodulated_acc = APSK_32_feedback_demapper(rx_symbols, EbNoVec(n), s_2_pllr, delay_profile);
+        if iteration > W-1
 
-        % Converting to serial to parallel
-        s_2_p_rx_old = reshape(demodulated_acc, 5, length(demodulated_acc)/5);
+            %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+            s_2_p_forward_stack = zeros(5,length(rx_symbols),W);
+            s_2_p_backward_stack = zeros(5,length(rx_symbols),W);
 
+            for j = 1:num_sub_iter
+
+                % Handling the special case for initialization
+                if (j==1)
+                    start = 1;
+                else
+                    start = 2;
+                end
+
+                % Forward propagation
+                for w = start:W
+
+                    if w>1
+
+                        %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+
+                        % Reverse delay module
+                        undecoded = s_2_p_forward_stack(:,:,w-1);
+                        if j == 1
+                            undecoded(delay_profile == 1, :) = s_2_p_rx_stack(delay_profile == 1, :, w);
+                        else
+                            undecoded(delay_profile == 1, :) = s_2_p_backward_stack(delay_profile == 1, :, w);                            
+                        end
+                        % Ready to decode
+                        undecoded_T = undecoded.';
+                        undecoded_flat = undecoded_T(:);
+                
+                        % Deinterleaving
+                        undecoded_deintered = randdeintrlv(undecoded_flat,seed); % Deinterleave.
+
+                        % Decoding
+                        decodedllr = ldpcDecoder(undecoded_deintered);
+                        % rxBits = ldpcDecoderHard(undecoded_deintered);
+                        rxBits = decodedllr(1:43200)<0;
+
+                        %%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+                        % Storing soft LLR values for feedback
+                        
+                        % Interleaving
+                        interllr = randintrlv(decodedllr,seed); % Interleave.
+
+                        % Serial to parallel
+                        s_2_pllr = reshape(interllr, length(interllr)/5, 5).';
+                        % s_2_pllr(delay_profile == 0, :) = 0;
+
+                    end
+
+                    demodulated_acc = APSK_32_feedback_demapper(rx_symbols_stack(:,w), EbNoVec(n), s_2_pllr, delay_profile);
+            
+                    % Converting to serial to parallel
+                    % s_2_p_rx_old = reshape(demodulated_acc, 5, length(demodulated_acc)/5);
+
+                    s_2_p_forward_stack(:,:,w) = reshape(demodulated_acc, 5, length(demodulated_acc)/5);
+
+                end
+
+                % Backward propagation
+                for w = (W-1):-1:1
+
+                    demodulated_acc = APSK_32_feedback_demapper(rx_symbols_stack(:,w), EbNoVec(n), s_2_pllr, inverse_delay_profile);
+
+                    % Converting to serial to parallel
+                    s_2_p_backward_stack(:,:,w) = reshape(demodulated_acc, 5, length(demodulated_acc)/5);
+
+                    if w > 1
+                        % Reverse delay module
+                        undecoded = s_2_p_backward_stack(:,:,w);
+                        undecoded(inverse_delay_profile == 1, :) = s_2_p_forward_stack(inverse_delay_profile == 1, :, w-1);
+    
+                        % Ready to decode
+                        undecoded_T = undecoded.';
+                        undecoded_flat = undecoded_T(:);
+    
+                        % Deinterleaving
+                        undecoded_deintered = randdeintrlv(undecoded_flat,seed); % Deinterleave.
+    
+                        % Decoding
+                        decodedllr = ldpcDecoder(undecoded_deintered);
+                        % rxBits = ldpcDecoderHard(undecoded_deintered);
+                        if w == 2
+                            rxBits = decodedllr(1:43200)<0;
+                            % MSG=rxBits;
+                            % 
+                            % % Calculate the number of bit errors
+                            % 
+                            % nErrors0 = biterr(msg0,MSG);
+                            % 
+                            % nErrors1 = biterr(msg1,MSG);
+                            % 
+                            % nErrors2 = biterr(msg2,MSG);
+                            % 
+                            % nErrors3 = biterr(msg3,MSG);
+                            % 
+                            % % Increment the error and bit counters
+                            % min([nErrors0 nErrors1 nErrors2 nErrors3])
+
+                        end
+                        %%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+                        % Storing soft LLR values for feedback
+    
+                        % Interleaving
+                        interllr = randintrlv(decodedllr,seed); % Interleave.
+    
+                        % Serial to parallel
+                        s_2_pllr = reshape(interllr, length(interllr)/5, 5).';
+                        % s_2_pllr(inverse_delay_profile == 0, :) = 0;
+
+                    end
+                end
+            end
+            MSG=rxBits;
+
+            % Calculate the number of bit errors
+
+            nErrors0 = biterr(msg0,MSG);
+
+            nErrors1 = biterr(msg1,MSG);
+
+            nErrors2 = biterr(msg2,MSG);
+
+            nErrors3 = biterr(msg3,MSG);
+
+            % Increment the error and bit counters
+            numErrs = numErrs + min([nErrors0 nErrors1 nErrors2 nErrors3])
+            numBits = numBits + length(msg0)
+            numErrs/numBits
+        end
     end
 
     numErrs
@@ -162,14 +254,6 @@ grid
 legend('Estimated BER ldpc')
 xlabel('Eb/No (dB)')
 ylabel('Bit Error Rate')
-
-
-
-
-
-
-
-
 
 
 % test_sym = [0.964523701047841 + 0.675167092165942j
